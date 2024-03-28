@@ -25,6 +25,7 @@ from augment import new_data_aug_generator
 
 import models
 import models_v2
+import models_vhop
 
 import utils
 
@@ -156,7 +157,7 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19'],
+    parser.add_argument('--data-set', default='CIFAR', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19'],
                         type=str, help='Image Net dataset path')
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
@@ -173,18 +174,25 @@ def get_args_parser():
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
     parser.add_argument('--eval-crop-ratio', default=0.875, type=float, help="Crop ratio for evaluation")
     parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
-    parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--pin-mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem',
                         help='')
     parser.set_defaults(pin_mem=True)
-
+    
+    # vhop setting    
+    parser.add_argument('--mode', default='sparsemax') # 'sparsemax' or 'entmax' or 'softmax_1' or 'softmax'
+    parser.add_argument('--step_size',type=int, default=1)
+    
     # distributed training parameters
     parser.add_argument('--distributed', action='store_true', default=False, help='Enabling distributed training')
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    
+    parser.add_argument('--kernel', action='store_true', help='Use kernel forward')
+
     return parser
 
 
@@ -260,17 +268,11 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     print(f"Creating model: {args.model}")
-    model = create_model(
-        args.model,
-        pretrained=False,
-        num_classes=args.nb_classes,
-        drop_rate=args.drop,
-        drop_path_rate=args.drop_path,
-        drop_block_rate=None,
-        img_size=args.input_size
-    )
 
-                    
+    if 'deit' in args.model:
+        model = models_v2.__dict__[args.model](pretrained=False, num_classes=args.nb_classes, drop_rate=args.drop, drop_path_rate=args.drop_path, drop_block_rate=None, img_size=args.input_size)
+    elif 'vhop' in args.model:   
+        model = models_vhop.__dict__[args.model](pretrained=False, num_classes=args.nb_classes, drop_rate=args.drop, drop_path_rate=args.drop_path, drop_block_rate=None, img_size=args.input_size, mode = args.mode, step_size = args.step_size)       
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -306,7 +308,8 @@ def main(args):
         checkpoint_model['pos_embed'] = new_pos_embed
 
         model.load_state_dict(checkpoint_model, strict=False)
-        
+        print('Start Fine Tuning..................')
+   
     if args.attn_only:
         for name_p,p in model.named_parameters():
             if '.attn.' in name_p:
@@ -329,6 +332,13 @@ def main(args):
         except:
             print('no patch embed')
             
+    if args.kernel:
+        for name_p, p in model.named_parameters():
+            if 'kernel' in name_p:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False   
+        print('Use kernel forward only..................')
     model.to(device)
 
     model_ema = None
@@ -341,8 +351,10 @@ def main(args):
             resume='')
 
     model_without_ddp = model
+    print("Model = %s" % str(model_without_ddp))
+
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
