@@ -10,6 +10,8 @@ from timm_old.models.vision_transformer import Mlp, PatchEmbed , _cfg
 from timm_old.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm_old.models.registry import register_model
 
+from src.layers1 import MemoryAssociation
+
 class Attention(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
@@ -39,6 +41,23 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
     
+    def forward_with_query(self, x):
+        
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        query = q
+        q = q * self.scale
+
+        attn = (q @ k.transpose(-2, -1))
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x, query
+
 class Block(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
@@ -138,6 +157,71 @@ class Block_paralx2(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x))) + self.drop_path(self.mlp1(self.norm21(x)))
         return x
         
+class SideMemory(nn.Module):
+
+    def __init__(
+            self,
+            d_model,
+            n_heads,
+            d_keys=None,
+            memory_size=None,
+            update_steps=1,
+            dropout=0.1,
+            mode='softmax',
+            scale=None):
+        super(SideMemory, self).__init__()
+
+        self.d_model = d_model
+        d_keys = int(d_model/n_heads)
+        self.inner_attention = Association(
+            scale=scale, attention_dropout=dropout, mode=mode)
+        self.dsp = nn.Linear(d_model, d_keys * n_heads)
+        self.query_projection = nn.Linear(d_keys * n_heads, d_keys * n_heads)
+        self.key_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.values_projection = nn.Linear(d_model, d_keys * n_heads)
+
+        self.out_projection = nn.Linear(d_keys * n_heads, d_model)
+        self.n_heads = n_heads
+        self.update_steps = update_steps
+
+        # self.memory = nn.Parameter(
+        #     torch.randn(
+        #         size=(memory_size, n_heads, d_keys), dtype=torch.float32),
+        #     requires_grad=True)
+
+        self.mlp = Mlp(in_features=d_model, hidden_features=d_model*4, act_layer=nn.GELU, drop=dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        # self.gate = nn.Parameter(
+        #     torch.randn(
+        #         size=(1), dtype=torch.float32),
+        #     requires_grad=True)
+
+    def forward(self, R, mask=None):
+
+        B, L, _ = R.shape
+        H = self.n_heads
+
+        # R is from the backbone (after downsampling)
+        queries = self.query_projection(R).view(B, L, H, -1)
+        # memory = self.memory.unsqueeze(0).repeat(B, 1, 1, 1)
+        keys = self.key_projection(R).view(B, L, H, -1)
+        values = self.values_projection(R).view(B, L, H, -1)
+
+        for i in range(self.update_steps):
+
+            queries = self.inner_attention(
+                queries,
+                keys,
+                values,
+                mask
+            )
+
+        ret = queries
+        ret = ret.view(B, ret.size(1), -1) + R
+        ret = self.out_projection(ret)
+        out = ret + self.mlp(self.norm2(ret))
+        return out
         
 class hMLP_stem(nn.Module):
     """ hMLP_stem: https://arxiv.org/pdf/2203.09795.pdf
@@ -185,14 +269,15 @@ class vit_models(nn.Module):
         
         self.dropout_rate = drop_rate
 
-            
+        self.embed_dim = embed_dim
+        self.ratio = 2
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim
 
         self.patch_embed = Patch_layer(
                 img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
-
+        self.num_patches = num_patches
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
@@ -204,12 +289,9 @@ class vit_models(nn.Module):
                 drop=0.0, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
                 act_layer=act_layer,Attention_block=Attention_block,Mlp_block=Mlp_block,init_values=init_scale)
             for i in range(depth)])
-        
-
-        
             
         self.norm = norm_layer(embed_dim)
-
+        self.num_heads = num_heads
         self.feature_info = [dict(num_chs=embed_dim, reduction=0, module='head')]
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
@@ -265,6 +347,89 @@ class vit_models(nn.Module):
         x = self.head(x)
         
         return x
+
+    def add_memory(self, n_classes):
+
+        for param in self.parameters():
+            param.requires_grad = False
+
+        self.memory_layer = Layer_scale_init_Block(self.embed_dim, self.num_heads, Attention_block=MemoryAssociation)
+        self.fc_tune = nn.Linear(self.embed_dim, n_classes)
+
+    def memory_forward(self, x):
+
+        with torch.no_grad():
+            B = x.shape[0]
+            x = self.patch_embed(x)
+
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            
+            x = x + self.pos_embed
+            
+            x = torch.cat((cls_tokens, x), dim=1)
+                
+            for i , blk in enumerate(self.blocks):
+                x = blk(x)
+        
+        x = self.memory_layer(x)
+        x = self.norm(x[:, 0])
+        if self.dropout_rate:
+            x = F.dropout(x, p=float(self.dropout_rate), training=self.training)
+        x = self.fc_tune(x)
+        
+        return x
+
+    def add_side_tuning(self, n_classes):
+
+        # freeze params
+        for param in self.parameters():
+            param.requires_grad = False
+
+        side_blocks = []
+        for i in range(len(self.blocks)):
+            side_blocks.append(SideMemory(int(self.embed_dim/self.ratio),  n_heads=self.num_heads, memory_size=self.num_patches))
+        
+        dsp_blocks = []
+        for i in range(len(self.blocks)):
+            dsp_blocks.append(nn.Linear(self.embed_dim, int(self.embed_dim/self.ratio)))
+
+        self.side_blocks = nn.ModuleList(side_blocks)
+        self.dsp_blocks = nn.ModuleList(dsp_blocks)
+        self.fc_tune = nn.Linear(int(self.embed_dim/self.ratio), n_classes)
+        # self.cls_tune_tokens = nn.Parameter(torch.zeros(1, 1, int(self.embed_dim/self.ratio)), requires_grad=True)
+        self.tune_norm = nn.LayerNorm(int(self.embed_dim/self.ratio))
+
+    def side_tune_forward(self, x):
+
+        B = x.shape[0]
+        with torch.no_grad():
+            x = self.patch_embed(x)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        
+        x = x + self.pos_embed        
+        query = x
+        x = torch.cat((cls_tokens, x), dim=1) 
+
+        org_x = []
+        with torch.no_grad():
+            for i , blk in enumerate(self.blocks):
+                x = blk(x)
+                org_x.append(x.detach())
+
+        dsp_x = []
+        for i, blk in enumerate(self.dsp_blocks):
+            if i == 0:
+                dsp_x.append(blk(x))
+            dsp_x.append(blk(org_x[i]))
+
+        res = dsp_x[0]
+        for i, blk in enumerate(self.side_blocks):
+            query = blk(res)
+            res = query
+
+        query = self.tune_norm(query)
+        return self.fc_tune(query[:, 0])
 
 # DeiT III: Revenge of the ViT (https://arxiv.org/abs/2204.07118)
 

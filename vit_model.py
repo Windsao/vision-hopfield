@@ -9,8 +9,9 @@ from timm_old.models.vision_transformer import Mlp, PatchEmbed , _cfg
 
 from timm_old.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm_old.models.registry import register_model
-from src.blocks import Block, Layer_scale_init_Block_hp, Layer_scale_init_Block_paralx2_hp, Block_paralx2_hp
-from src.layers1 import Hopfield, MemoryAssociation
+
+from src.layers1 import MemoryAssociation
+
 
 class Attention(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
@@ -41,22 +42,36 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
     
+class Block(nn.Module):
+    # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,Attention_block = Attention,Mlp_block=Mlp
+                 ,init_values=1e-4):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention_block(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp_block(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x 
+    
 class Layer_scale_init_Block(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     # with slight modifications
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,Attention_block = MemoryAssociation,Mlp_block=Mlp
-                 ,init_values=1e-4, memory_size=None):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,Attention_block = Attention,Mlp_block=Mlp
+                 ,init_values=1e-4):
         super().__init__()
         self.norm1 = norm_layer(dim)
-
-        try:
-            self.attn = Attention_block(
-                dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, memory_size=memory_size)
-        except:
-            self.attn = Attention_block(
-                dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-
+        self.attn = Attention_block(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -125,7 +140,7 @@ class Block_paralx2(nn.Module):
         x = x + self.drop_path(self.attn(self.norm1(x))) + self.drop_path(self.attn1(self.norm11(x)))
         x = x + self.drop_path(self.mlp(self.norm2(x))) + self.drop_path(self.mlp1(self.norm21(x)))
         return x
-        
+              
 class hMLP_stem(nn.Module):
     """ hMLP_stem: https://arxiv.org/pdf/2203.09795.pdf
     taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
@@ -155,7 +170,7 @@ class hMLP_stem(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
     
-class vhop_models(nn.Module):
+class vit_models(nn.Module):
     """ Vision Transformer with LayerScale (https://arxiv.org/abs/2103.17239) support
     taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     with slight modifications
@@ -165,14 +180,13 @@ class vhop_models(nn.Module):
                  drop_path_rate=0., norm_layer=nn.LayerNorm, global_pool=None,
                  block_layers = Block,
                  Patch_layer=PatchEmbed,act_layer=nn.GELU,
-                  Mlp_block=Mlp,
-                  Attention_block = Attention,
+                 Attention_block = Attention, Mlp_block=Mlp,
                 dpr_constant=True,init_scale=1e-4,
-                mlp_ratio_clstk = 4.0, mode='softmax', step_size=1, **kwargs):
+                mlp_ratio_clstk = 4.0,**kwargs):
         super().__init__()
         
         self.dropout_rate = drop_rate
-    
+
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim
 
@@ -185,35 +199,13 @@ class vhop_models(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
 
         dpr = [drop_path_rate for i in range(depth)]
-
-        layers = [
+        self.blocks = nn.ModuleList([
             block_layers(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=0.0, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, Attention_block=Hopfield,
-                act_layer=act_layer, Mlp_block=Mlp_block,init_values=init_scale, mode=mode, step_size=step_size)
-            for i in range(depth)]
+                drop=0.0, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
+                act_layer=act_layer,Attention_block=Attention_block,Mlp_block=Mlp_block,init_values=init_scale)
+            for i in range(depth)])
         
-        layers.append(block_layers(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=0.0, attn_drop=attn_drop_rate, drop_path=dpr[-1], norm_layer=norm_layer, Attention_block=MemoryAssociation,
-                act_layer=act_layer, Mlp_block=Mlp_block,init_values=init_scale, mode=mode, step_size=step_size, memory_size=num_patches))
-
-        self.blocks = nn.ModuleList(layers)
-
-        # self.blocks = nn.ModuleList([
-        #     block_layers(
-        #         dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-        #         drop=0.0, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, Attention_block=Hopfield,
-        #         act_layer=act_layer, Mlp_block=Mlp_block,init_values=init_scale, mode=mode, step_size=step_size)
-        #     for i in range(depth-1)])
-
-        # self.blocks = nn.ModuleList([
-        #     block_layers(
-        #         dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-        #         drop=0.0, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, Attention_block=MemoryAssociation,
-        #         act_layer=act_layer, Mlp_block=Mlp_block,init_values=init_scale, mode=mode, step_size=step_size, memory_size=num_patches)
-        #     for i in range(depth)])
-
         self.norm = norm_layer(embed_dim)
 
         self.feature_info = [dict(num_chs=embed_dim, reduction=0, module='head')]
@@ -275,8 +267,8 @@ class vhop_models(nn.Module):
 # DeiT III: Revenge of the ViT (https://arxiv.org/abs/2204.07118)
 
 @register_model
-def vhop_tiny_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,   **kwargs):
-    model = vhop_models(
+def deit_tiny_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,   **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block, **kwargs)
     
@@ -284,8 +276,8 @@ def vhop_tiny_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,
     
     
 @register_model
-def vhop_small_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_small_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block, **kwargs)
     model.default_cfg = _cfg()
@@ -305,8 +297,8 @@ def vhop_small_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False
     return model
 
 @register_model
-def vhop_medium_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False, **kwargs):
-    model = vhop_models(
+def deit_medium_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False, **kwargs):
+    model = vit_models(
         patch_size=16, embed_dim=512, depth=12, num_heads=8, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block, **kwargs)
     model.default_cfg = _cfg()
@@ -325,8 +317,8 @@ def vhop_medium_patch16_LS(pretrained=False, img_size=224, pretrained_21k = Fals
     return model 
 
 @register_model
-def vhop_base_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_base_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block, **kwargs)
     if pretrained:
@@ -344,8 +336,8 @@ def vhop_base_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,
     return model
     
 @register_model
-def vhop_large_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_large_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block, **kwargs)
     if pretrained:
@@ -363,8 +355,8 @@ def vhop_large_patch16_LS(pretrained=False, img_size=224, pretrained_21k = False
     return model
     
 @register_model
-def vhop_huge_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_huge_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=14, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block, **kwargs)
     if pretrained:
@@ -382,48 +374,48 @@ def vhop_huge_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,
     return model
     
 @register_model
-def vhop_huge_patch14_52_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_huge_patch14_52_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=14, embed_dim=1280, depth=52, num_heads=16, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block, **kwargs)
 
     return model
     
 @register_model
-def vhop_huge_patch14_26x2_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_huge_patch14_26x2_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=14, embed_dim=1280, depth=26, num_heads=16, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block_paralx2, **kwargs)
 
     return model
     
 @register_model
-def vhop_Giant_48x2_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_Giant_48x2_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=14, embed_dim=1664, depth=48, num_heads=16, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Block_paral_LS, **kwargs)
 
     return model
 
 @register_model
-def vhop_giant_40x2_patch14_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_giant_40x2_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=14, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Block_paral_LS_hp, **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Block_paral_LS, **kwargs)
     return model
 
 @register_model
-def vhop_Giant_48_patch14_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_Giant_48_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=14, embed_dim=1664, depth=48, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block_hp, **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block, **kwargs)
     return model
 
 @register_model
-def vhop_giant_40_patch14_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_giant_40_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=14, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block_hp, **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block, **kwargs)
     #model.default_cfg = _cfg()
 
     return model
@@ -431,32 +423,32 @@ def vhop_giant_40_patch14_LS_hf(pretrained=False, img_size=224, pretrained_21k =
 # Models from Three things everyone should know about Vision Transformers (https://arxiv.org/pdf/2203.09795.pdf)
 
 @register_model
-def vhop_small_patch16_36_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_small_patch16_36_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=384, depth=36, num_heads=6, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block, **kwargs)
 
     return model
     
 @register_model
-def vhop_small_patch16_36(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_small_patch16_36(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=384, depth=36, num_heads=6, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
     return model
     
 @register_model
-def vhop_small_patch16_18x2_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_small_patch16_18x2_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=384, depth=18, num_heads=6, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_paralx2, **kwargs)
 
     return model
     
 @register_model
-def vhop_small_patch16_18x2(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_small_patch16_18x2(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=384, depth=18, num_heads=6, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Block_paralx2, **kwargs)
 
@@ -464,8 +456,8 @@ def vhop_small_patch16_18x2(pretrained=False, img_size=224, pretrained_21k = Fal
     
   
 @register_model
-def vhop_base_patch16_18x2_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_base_patch16_18x2_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=768, depth=18, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_paralx2, **kwargs)
 
@@ -473,250 +465,26 @@ def vhop_base_patch16_18x2_LS(pretrained=False, img_size=224, pretrained_21k = F
 
 
 @register_model
-def vhop_base_patch16_18x2_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_base_patch16_18x2(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=768, depth=18, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Block_paralx2_hp, **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Block_paralx2, **kwargs)
 
     return model
     
 
 @register_model
-def vhop_base_patch16_36x1_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_base_patch16_36x1_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=768, depth=36, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block, **kwargs)
 
     return model
 
 @register_model
-def vhop_base_patch16_36x1(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
+def deit_base_patch16_36x1(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
+    model = vit_models(
         img_size = img_size, patch_size=16, embed_dim=768, depth=36, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
     return model
-
-@register_model
-def vhop_tiny_patch16_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,   **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_hp, **kwargs)
-    
-    return model
-    
-    
-@register_model
-def vhop_small_patch16_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_hp, **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        name = 'https://dl.fbaipublicfiles.com/deit/deit_3_small_'+str(img_size)+'_'
-        if pretrained_21k:
-            name+='21k.pth'
-        else:
-            name+='1k.pth'
-            
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url=name,
-            map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(checkpoint["model"])
-
-    return model
-
-@register_model
-def vhop_medium_patch16_LS_hf(pretrained=False, img_size=224, pretrained_21k = False, **kwargs):
-    model = vhop_models(
-        patch_size=16, embed_dim=512, depth=12, num_heads=8, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block_hp, **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        name = 'https://dl.fbaipublicfiles.com/deit/deit_3_medium_'+str(img_size)+'_'
-        if pretrained_21k:
-            name+='21k.pth'
-        else:
-            name+='1k.pth'
-            
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url=name,
-            map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(checkpoint["model"])
-    return model 
-
-@register_model
-def vhop_base_patch16_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_hp, **kwargs)
-    if pretrained:
-        name = 'https://dl.fbaipublicfiles.com/deit/deit_3_base_'+str(img_size)+'_'
-        if pretrained_21k:
-            name+='21k.pth'
-        else:
-            name+='1k.pth'
-            
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url=name,
-            map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(checkpoint["model"])
-    return model
-    
-@register_model
-def vhop_large_patch16_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_hp, **kwargs)
-    if pretrained:
-        name = 'https://dl.fbaipublicfiles.com/deit/deit_3_large_'+str(img_size)+'_'
-        if pretrained_21k:
-            name+='21k.pth'
-        else:
-            name+='1k.pth'
-            
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url=name,
-            map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(checkpoint["model"])
-    return model
-    
-@register_model
-def vhop_huge_patch14_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=14, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block_hp, **kwargs)
-    if pretrained:
-        name = 'https://dl.fbaipublicfiles.com/deit/deit_3_huge_'+str(img_size)+'_'
-        if pretrained_21k:
-            name+='21k_v1.pth'
-        else:
-            name+='1k_v1.pth'
-            
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url=name,
-            map_location="cpu", check_hash=True
-        )
-        model.load_state_dict(checkpoint["model"])
-    return model
-    
-@register_model
-def vhop_huge_patch14_52_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=14, embed_dim=1280, depth=52, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block_hp, **kwargs)
-
-    return model
-    
-@register_model
-def vhop_huge_patch14_26x2_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=14, embed_dim=1280, depth=26, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block_paralx2_hp, **kwargs)
-
-    return model
-    
-@register_model
-def vhop_Giant_48x2_patch14_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=14, embed_dim=1664, depth=48, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Block_paral_LS_hp, **kwargs)
-
-    return model
-
-@register_model
-def vhop_giant_40x2_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=14, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Block_paral_LS, **kwargs)
-    return model
-
-@register_model
-def vhop_Giant_48_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=14, embed_dim=1664, depth=48, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block, **kwargs)
-    return model
-
-@register_model
-def vhop_giant_40_patch14_LS(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=14, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers = Layer_scale_init_Block, **kwargs)
-    #model.default_cfg = _cfg()
-
-    return model
-
-# Models from Three things everyone should know about Vision Transformers (https://arxiv.org/pdf/2203.09795.pdf)
-
-@register_model
-def vhop_small_patch16_36_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=384, depth=36, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_hp, **kwargs)
-
-    return model
-    
-@register_model
-def vhop_small_patch16_36(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=384, depth=36, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-
-    return model
-    
-@register_model
-def vhop_small_patch16_18x2_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=384, depth=18, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_paralx2_hp, **kwargs)
-
-    return model
-    
-@register_model
-def vhop_small_patch16_18x2_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=384, depth=18, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Block_paralx2_hp, **kwargs)
-
-    return model
-    
-  
-@register_model
-def vhop_base_patch16_18x2_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=768, depth=18, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_paralx2_hp, **kwargs)
-
-    return model
-
-
-@register_model
-def vhop_base_patch16_18x2_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=768, depth=18, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Block_paralx2_hp, **kwargs)
-
-    return model
-    
-
-@register_model
-def vhop_base_patch16_36x1_LS_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=768, depth=36, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),block_layers=Layer_scale_init_Block_hp, **kwargs)
-
-    return model
-
-@register_model
-def vhop_base_patch16_36x1_hf(pretrained=False, img_size=224, pretrained_21k = False,  **kwargs):
-    model = vhop_models(
-        img_size = img_size, patch_size=16, embed_dim=768, depth=36, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-
-    return model
-

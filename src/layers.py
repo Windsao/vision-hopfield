@@ -310,3 +310,54 @@ class HopfieldLayer(nn.Module):
         out = queries
         out = out.view(B, L, -1)
         return out
+
+class MemoryAssociation(nn.Module):
+
+    def __init__(
+            self,
+            d_model,
+            n_heads,
+            d_keys=None,
+            memory_size=None,
+            update_steps=1,
+            dropout=0.1,
+            mode='softmax',
+            scale=None):
+        super(MemoryAssociation, self).__init__()
+
+        d_keys = d_keys or (d_model // n_heads)
+        self.d_model = d_model
+
+        self.inner_attention = Association(
+            scale=scale, attention_dropout=dropout, mode=mode)
+        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.out_projection = nn.Linear(d_keys * n_heads, d_model)
+        self.n_heads = n_heads
+        self.update_steps = update_steps
+
+        self.memory = nn.Parameter(
+            torch.randn(
+                size=(memory_size, n_heads, d_keys), dtype=torch.float32),
+            requires_grad=True)
+
+    def forward(self, R, mask=None):
+
+        B, L, _ = R.shape
+        H = self.n_heads
+
+        queries = self.query_projection(R).view(B, L, H, -1)
+        memory = self.memory.unsqueeze(0).repeat(B, 1, 1, 1)
+
+        for i in range(self.update_steps):
+
+            queries = self.inner_attention(
+                queries,
+                memory,
+                memory,
+                mask
+            )
+
+        out = queries
+        out = out.view(B, L, -1)
+
+        return self.out_projection(out)

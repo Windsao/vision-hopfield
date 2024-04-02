@@ -879,5 +879,4 @@
 {"train_lr": 1.197129133890222e-05, "train_loss": 4.054239679536511, "epoch": 298, "n_parameters": 5721832}
 {"train_lr": 1.0876169517992246e-05, "train_loss": 3.976592065441993, "epoch": 299, "n_parameters": 5721832}
 
-
 eval: 68.4%

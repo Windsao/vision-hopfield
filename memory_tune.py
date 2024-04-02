@@ -18,7 +18,7 @@ from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from datasets import build_dataset
-from engine import train_one_epoch, evaluate
+from engine import train_one_epoch, evaluate, tune_memory_one_epoch, memory_evaluate
 from losses import DistillationLoss
 from samplers import RASampler
 from augment import new_data_aug_generator
@@ -210,8 +210,6 @@ def get_args_parser():
 #         tgt_memory.append(memory_set[   , :])
 #     partial_energy = torch.log(torch.exp(query@memory_set.T).sum(-1)) # partial_energy: (batch_size)
 
-
-
 def main(args):
     utils.init_distributed_mode(args)
 
@@ -302,7 +300,7 @@ def main(args):
             if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
                 print(f"Removing key {k} from pretrained checkpoint")
                 del checkpoint_model[k]
-
+        
         # interpolate position embedding
         pos_embed_checkpoint = checkpoint_model['pos_embed']
         embedding_size = pos_embed_checkpoint.shape[-1]
@@ -321,11 +319,12 @@ def main(args):
             pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
         pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
         new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-        checkpoint_model['pos_embed'] = new_pos_embed
+        # checkpoint_model['pos_embed'] = new_pos_embed
 
         model.load_state_dict(checkpoint_model, strict=False)
-        print('Start Fine Tuning..................')
-   
+        model.add_memory(args.nb_classes)
+        print('Start Fine Tuning..................')        
+
     if args.attn_only:
         for name_p,p in model.named_parameters():
             if '.attn.' in name_p:
@@ -449,7 +448,7 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_stats = train_one_epoch(
+        train_stats = tune_memory_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, model_ema, mixup_fn,
@@ -472,7 +471,7 @@ def main(args):
                 }, checkpoint_path)
              
 
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = memory_evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         
         if max_accuracy < test_stats["acc1"]:
@@ -496,9 +495,6 @@ def main(args):
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
                      'n_parameters': n_parameters}
-        
-        
-        
         
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:

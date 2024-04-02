@@ -407,5 +407,58 @@ class Hopfield(nn.Module):
 
         return self.out_projection(out)
     
-    
-    
+class MemoryAssociation(nn.Module):
+
+    def __init__(
+            self,
+            dim,
+            num_heads = 8,
+            d_keys=None,
+            d_values=None,
+            qkv_bias: bool = False,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+            qk_scale=None,
+            mode='softmax',
+            step_size: int = 1,
+            memory_size=100,
+            ):
+        super(MemoryAssociation, self).__init__()
+
+        d_model = dim
+        d_keys = d_keys or (d_model // num_heads)
+        self.d_model = d_model
+
+        self.inner_attention = Association(
+            scale=qk_scale, attention_dropout=attn_drop, mode=mode)
+        self.query_projection = nn.Linear(d_model, d_keys * num_heads)
+        self.out_projection = nn.Linear(d_keys * num_heads, d_model)
+        self.n_heads = num_heads
+        self.update_steps = step_size
+
+        self.memory = nn.Parameter(
+            torch.randn(
+                size=(memory_size, num_heads, d_keys), dtype=torch.float32),
+            requires_grad=True)
+
+    def forward(self, R, mask=None):
+
+        B, L, _ = R.shape
+        H = self.n_heads
+
+        queries = self.query_projection(R).view(B, L, H, -1)
+        memory = self.memory.unsqueeze(0).repeat(B, 1, 1, 1)
+
+        for i in range(self.update_steps):
+
+            queries = self.inner_attention(
+                queries,
+                memory,
+                memory,
+                mask
+            )
+
+        out = queries
+        out = out.view(B, L, -1)
+
+        return self.out_projection(out)

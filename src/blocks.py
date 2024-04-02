@@ -15,7 +15,7 @@ from einops import rearrange, repeat
 import numpy as np
 import math
 from math import sqrt
-from src.layers1 import Hopfield
+from src.layers1 import Hopfield, MemoryAssociation
 
 
 class LayerScale(nn.Module):
@@ -36,15 +36,26 @@ class Block(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,Attention_block = Hopfield, Mlp_block=Mlp
-                 ,init_values=1e-4, mode='softmax',step_size = 1):
+                 ,init_values=1e-4, mode='softmax',step_size = 1, memory_size=None):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention_block(
-            dim=dim, num_heads=num_heads, 
-            qkv_bias=True,  qk_scale=qk_scale,
-            attn_drop=attn_drop, proj_drop=drop,
-            mode=mode, step_size=step_size
-        )
+
+        if memory_size == None:
+            self.attn = Attention_block(
+                dim=dim, num_heads=num_heads, 
+                qkv_bias=True,  qk_scale=qk_scale,
+                attn_drop=attn_drop, proj_drop=drop,
+                mode=mode, step_size=step_size
+            )
+
+        else:
+            self.attn = Attention_block(
+                dim=dim, num_heads=num_heads, 
+                qkv_bias=True,  qk_scale=qk_scale,
+                attn_drop=attn_drop, proj_drop=drop,
+                mode=mode, step_size=step_size, memory_size=memory_size
+            )
+
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -61,17 +72,25 @@ class Layer_scale_init_Block_hp(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     # with slight modifications
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,Mlp_block=Mlp, Attention_block = Hopfield
-                 ,init_values=1e-4, mode='softmax',step_size = 1):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,Mlp_block=Mlp, Attention_block = MemoryAssociation
+                 ,init_values=1e-4, mode='softmax',step_size = 1, memory_size=None):
         super().__init__()
         self.norm1 = norm_layer(dim)
 
-        self.attn = Attention_block(
-            dim=dim, num_heads=num_heads, 
-            qkv_bias=True,  qk_scale=qk_scale,
-            attn_drop=attn_drop, proj_drop=drop,
-            mode=mode, step_size=step_size,
-        )
+        try:
+            self.attn = Attention_block(
+                dim=dim, num_heads=num_heads, 
+                qkv_bias=True,  qk_scale=qk_scale,
+                attn_drop=attn_drop, proj_drop=drop,
+                mode=mode, step_size=step_size, memory_size=memory_size
+            )
+        except:
+            self.attn = Attention_block(
+                dim=dim, num_heads=num_heads, 
+                qkv_bias=True,  qk_scale=qk_scale,
+                attn_drop=attn_drop, proj_drop=drop,
+                mode=mode, step_size=step_size
+            )
 
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -85,8 +104,7 @@ class Layer_scale_init_Block_hp(nn.Module):
         x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x)))
         x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
         return x
-    
-    
+
 class Layer_scale_init_Block_paralx2_hp(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     # with slight modifications
